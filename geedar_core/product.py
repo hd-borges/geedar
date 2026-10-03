@@ -343,36 +343,6 @@ class Product:
         if self._optimized:
             self.reset()
 
-        # Auxilliary function for setting image properties.
-        def set_prop(image):
-            image = ee.Image(image)
-            img_date = image.date()
-            return ee.Image(image.set(
-                "img_date", img_date.format("YYYY-MM-dd"),
-                "img_time", img_date.format("HH:mm"),
-                "img_datetime", img_date.format("YYYY-MM-dd HH:mm")))
-
-        # Auxilliary function for image mosaicking.
-        def mosaic_by_date(dt_str, coll):
-            date_str = ee.String(dt_str)
-            date = ee.Date.parse("YYYY-MM-dd HH:mm", date_str)
-            date_filter = ee.Filter.date(date, date.advance(1, "day"))
-            local_coll = coll.filter(date_filter)
-            first_img = local_coll.first()
-            props = first_img.toDictionary(
-                first_img.propertyNames()).remove(["system:footprint"], True)
-            proj = first_img.select(product.scale_ref_band).projection()
-            band_names = first_img.bandNames()
-            mosaic = ee.Image(local_coll.reduce(ee.Reducer.median()).set(
-                props)).setDefaultProjection(proj).rename(band_names)
-            return ee.Image(mosaic)
-
-        # Auxilliary function to rescale the spectral bands.
-        def rescale_spectral_bands(image):
-            final_image = image.multiply(product.scaling_factor).add(
-                product.offset).copyProperties(image)
-            return final_image
-
         if type(virtual_station).__name__ != "VirtualStation":
             raise TypeError("'virtual_station' must be a VirtualStation "
                 + "object.")
@@ -434,61 +404,25 @@ class Product:
         # Update the product attribute.
         self.date_list = date_list
 
-        # The product code.
-        product_code = product.product_code
+        # Build the collection. The need to mosaic is decided here, once, for
+        # the whole period, and reused by 'get_group_collection'.
+        image_collection, mosaicked, img_datetimes = self._build_collection(
+            aoi, start_date, end_date, date_list, clip)
+        self._filter_params = {
+            "aoi": aoi,
+            "end_date": end_date,
+            "clip": clip,
+            "mosaicked": mosaicked
+        }
 
-        # Filter by area of interest and by dates/period of interest and
-        # insert product and date and time str tags.
-        image_collection = ee.ImageCollection(
-            product.collection.filterBounds(aoi).filterDate(
-            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-            ).map(set_prop))
-        # If time info is missing in the product, use the pre-defined time.
-        if product.fixed_time is not None:
-            if len(product.fixed_time) > 0:
-                try:
-                    fixed_time = datetime.strptime(product.fixed_time,
-                        "%H:%M").strftime("%H:%M")
-                except:
-                    raise ValueError("Unrecognized time format in the "
-                        + "attribute 'fixed_time' of the product "
-                        + str(product_code) + ".")
-                #fixed_datetime = (start_date.strftime("%Y-%m-%d") + " "
-                #    + fixed_time)
-                image_collection = ee.ImageCollection(image_collection.map(
-                    lambda image: image.set("img_time", fixed_time,
-                    "img_datetime", ee.String(image.get("img_date")).cat(
-                    " " + fixed_time))))
-        # If a list of dates was provided, apply one more filter.
-        if(len(date_list) > 0):
-            image_collection = ee.ImageCollection(image_collection.filter(
-                ee.Filter.inList("img_date", date_list)))
-
-        # Mosaic neighbor/overlapping images.
-        if product.need_to_mosaic:
-            img_dates = ee.List(
-                image_collection.aggregate_array("img_datetime"))
-            distinct_dates = ee.List(img_dates.distinct())
-            mosaic_collection = ee.ImageCollection(
-                distinct_dates.map(
-                lambda d: mosaic_by_date(d, image_collection)))
-            image_collection = ee.ImageCollection(ee.Algorithms.If(
-                img_dates.length().gt(distinct_dates.length()),
-                mosaic_collection, image_collection))
-
-        # Clip the images?
-        if clip:
-            image_collection = image_collection.map(
-                lambda image: ee.Image(image).clip(aoi))
-
-        # Rescale spectral bands.
-        if product.scaling_factor and product.offset:
-            image_collection = image_collection.map(rescale_spectral_bands)
-
-        # Save the list of available dates in the collection.
-        available_dates = image_collection.aggregate_array(
-            "img_datetime").getInfo()
-        available_dates.sort()
+        # Save the list of available dates in the collection (mosaicking
+        # leaves one image per distinct date and time).
+        if img_datetimes is None:
+            img_datetimes = image_collection.aggregate_array(
+                "img_datetime").getInfo()
+        if mosaicked:
+            img_datetimes = list(set(img_datetimes))
+        available_dates = sorted(img_datetimes)
         self.available_dates = available_dates
 
         # Update start and end dates accordingly to the available dates.
@@ -503,6 +437,130 @@ class Product:
         # Save the ee.ImageCollection object and set flag.
         self.collection = image_collection
         self._optimized = True
+
+    # Builds the filtered collection from the original one: area, period
+    # ('end_date' is exclusive) and dates of interest, date/time tags,
+    # mosaicking, clipping and rescaling. If 'mosaic' is None, the need to
+    # mosaic is decided from the image dates (one server request). Returns
+    # the collection, the mosaic decision and the image datetimes (if they
+    # were retrieved).
+    def _build_collection(self, aoi, start_date, end_date, date_list, clip,
+            mosaic=None):
+        product = self
+
+        # Auxilliary function for setting image properties.
+        def set_prop(image):
+            image = ee.Image(image)
+            img_date = image.date()
+            return ee.Image(image.set(
+                "img_date", img_date.format("YYYY-MM-dd"),
+                "img_time", img_date.format("HH:mm"),
+                "img_datetime", img_date.format("YYYY-MM-dd HH:mm")))
+
+        # Auxilliary function for image mosaicking.
+        def mosaic_by_date(dt_str, coll):
+            date_str = ee.String(dt_str)
+            date = ee.Date.parse("YYYY-MM-dd HH:mm", date_str)
+            date_filter = ee.Filter.date(date, date.advance(1, "day"))
+            local_coll = coll.filter(date_filter)
+            first_img = local_coll.first()
+            props = first_img.toDictionary(
+                first_img.propertyNames()).remove(["system:footprint"], True)
+            proj = first_img.select(product.scale_ref_band).projection()
+            band_names = first_img.bandNames()
+            mosaic = ee.Image(local_coll.reduce(ee.Reducer.median()).set(
+                props)).setDefaultProjection(proj).rename(band_names)
+            return ee.Image(mosaic)
+
+        # Auxilliary function to rescale the spectral bands.
+        def rescale_spectral_bands(image):
+            final_image = image.multiply(product.scaling_factor).add(
+                product.offset).copyProperties(image)
+            return final_image
+
+        # The product code.
+        product_code = product.product_code
+
+        # Filter by area of interest and by dates/period of interest and
+        # insert product and date and time str tags.
+        image_collection = ee.ImageCollection(
+            product._backup["collection"].filterBounds(aoi).filterDate(
+            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+            ).map(set_prop))
+        # If time info is missing in the product, use the pre-defined time.
+        if product.fixed_time is not None:
+            if len(product.fixed_time) > 0:
+                try:
+                    fixed_time = datetime.strptime(product.fixed_time,
+                        "%H:%M").strftime("%H:%M")
+                except:
+                    raise ValueError("Unrecognized time format in the "
+                        + "attribute 'fixed_time' of the product "
+                        + str(product_code) + ".")
+                image_collection = ee.ImageCollection(image_collection.map(
+                    lambda image: image.set("img_time", fixed_time,
+                    "img_datetime", ee.String(image.get("img_date")).cat(
+                    " " + fixed_time))))
+        # If a list of dates was provided, apply one more filter.
+        if(len(date_list) > 0):
+            image_collection = ee.ImageCollection(image_collection.filter(
+                ee.Filter.inList("img_date", date_list)))
+
+        # Mosaic neighbor/overlapping images (only if some date and time is
+        # shared by more than one image).
+        img_datetimes = None
+        if not product.need_to_mosaic:
+            mosaic = False
+        elif mosaic is None:
+            img_datetimes = image_collection.aggregate_array(
+                "img_datetime").getInfo()
+            mosaic = len(img_datetimes) > len(set(img_datetimes))
+        if mosaic:
+            distinct_dates = ee.List(image_collection.aggregate_array(
+                "img_datetime")).distinct()
+            image_collection = ee.ImageCollection(distinct_dates.map(
+                lambda d: mosaic_by_date(d, image_collection)))
+
+        # Clip the images?
+        if clip:
+            image_collection = image_collection.map(
+                lambda image: ee.Image(image).clip(aoi))
+
+        # Rescale spectral bands.
+        if product.scaling_factor and product.offset:
+            image_collection = image_collection.map(rescale_spectral_bands)
+
+        return image_collection, mosaic, img_datetimes
+
+    def get_group_collection(self, datetime_list):
+        """
+        Returns the optimized collection restricted to the images whose
+        'img_datetime' is in 'datetime_list' (str 'yyyy-mm-dd hh:mm'). The
+        collection is rebuilt from the original one only for the period
+        spanned by the list, so mosaicking and other per-image operations are
+        not applied to the whole period of interest (which may exceed the
+        Earth Engine memory limit). The result is equivalent to filtering the
+        attribute 'collection'.
+
+        """
+        if not self._optimized:
+            raise RuntimeError("The collection must be optimized first.")
+        if len(datetime_list) == 0:
+            return self.collection.filter(
+                ee.Filter.inList("img_datetime", []))
+
+        params = self._filter_params
+        dts = [datetime.strptime(d, "%Y-%m-%d %H:%M") for d in datetime_list]
+        start_date = min(dts).date()
+        # Keep the images of the day after the last date, which may be
+        # captured by the 1-day window of the mosaic (exclusive end).
+        end_date = min(max(dts).date() + timedelta(days=2),
+            params["end_date"])
+        image_collection, _, _ = self._build_collection(params["aoi"],
+            start_date, end_date, self.date_list, params["clip"],
+            mosaic=params["mosaicked"])
+        return ee.ImageCollection(image_collection.filter(
+            ee.Filter.inList("img_datetime", datetime_list)))
 
     # Masks "bad" pixels accordingly to the product attributes
     # 'quality_layer_names', 'quality_layer_inds', 'quality_layer_start_bits'

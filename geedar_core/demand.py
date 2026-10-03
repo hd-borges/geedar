@@ -1202,6 +1202,12 @@ class Demand:
             xdf = df2
             ordered_col_list = list(df2.columns)
 
+        # Keep the rows in chronological order: the dates returned by the
+        # server do not necessarily follow the requested order (ex: when Modis
+        # composites are split into single days) and the date slicing done
+        # before saving requires a monotonic index.
+        xdf = xdf.sort_index()
+
         # Order the data frame as in the "common bands dictionary". It only
         # works because the previously applied method '_add_common_band_cols'
         # returns a dict correctly ordered.
@@ -1298,9 +1304,11 @@ class Demand:
             while n_attempt <= 3 and n_timeouts < 2:
                 cur_date_list = date_list[
                     cur_date_index:(cur_date_index + cur_group_size)]
-                # Restrict the collection to the current group (dates).
-                image_collection = product.collection.filter(
-                    ee.Filter.inList("img_datetime", cur_date_list))
+                # Restrict the collection to the current group (dates). It is
+                # rebuilt only for the group period, avoiding mosaicking the
+                # whole period of interest (memory limit in GEE).
+                image_collection = product.get_group_collection(
+                    cur_date_list)
                 # Apply the cloud algorithm.
                 image_collection = cloud_algo.apply(product, virtual_station,
                     image_collection, cloud_algo_options)

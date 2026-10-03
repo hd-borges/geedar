@@ -380,14 +380,20 @@ def _split_modis_composites(image_collection, aoi, ref_band,
     def splitter(image, append_list):
         image = ee.Image(image)
         img_time = ee.String(image.get("img_time"))
-        year = image.date().get("year")
+        start_date = image.date()
+        year = start_date.get("year")
+        start_doy = start_date.getRelative("day", "year").add(1)
         append_list = ee.List(append_list)
         scale = image.select(ref_band).projection().nominalScale()
         days_of_year = image.select(day_of_year_band).reduceRegion(
             ee.Reducer.toList(), aoi, scale).values().flatten().distinct()
         def mask_updater(day, img_list):
             day = ee.Number(day)
-            img_date = ee.Date.fromYMD(year, 1, 1).advance(day.add(-1), "day")
+            # The last composite of a year also covers the first days of the
+            # next one, whose day of year restarts at 1.
+            img_year = ee.Number(year).add(day.lt(start_doy))
+            img_date = ee.Date.fromYMD(img_year, 1, 1).advance(
+                day.add(-1), "day")
             return ee.List(img_list).add(
                 image.updateMask(image.select(day_of_year_band).eq(day)).set(
                 "img_date", img_date.format("YYYY-MM-dd"), 
@@ -692,13 +698,19 @@ def wcs(product, virtual_station, image_collection, options):
             ee.Reducer.max(), aoi).values().getNumber(0)
         cluster_ids = ee.List.sequence(0, max_id)
                    
-        # Default: pick the cluster with the highest value.        
-        val_list = cluster_ids.map(
-            lambda id: ref_image.updateMask(
-            cluster_image.eq(ee.Number(id))).reduceRegion(
-            ee.Reducer.mean(), aoi).values().getNumber(0))
-        max_val = val_list.sort().getNumber(max_id)
-        water_cluster_id = val_list.indexOf(max_val)
+        # Default: pick the valid cluster with the highest value.
+        cluster_stats = ee.FeatureCollection(cluster_ids.map(
+            lambda id: ee.Feature(None, {
+                "cluster_id": id,
+                "selector_value": ref_image.updateMask(
+                    cluster_image.eq(ee.Number(id))).reduceRegion(
+                    ee.Reducer.mean(), aoi).values().get(0)
+            }))).filter(ee.Filter.notNull(["selector_value"]))
+        best_cluster = ee.Feature(ee.Algorithms.If(
+            cluster_stats.size().gt(0),
+            cluster_stats.sort("selector_value", False).first(),
+            ee.Feature(None, {"cluster_id": -1})))
+        water_cluster_id = best_cluster.getNumber("cluster_id")
 
         return image.updateMask(cluster_image.eq(water_cluster_id))
         
