@@ -207,6 +207,50 @@ def madeira_2023(df, options):
     return return_df
 
 
+# Médias de Rrs (sr^-1) dos 4 tipos ópticos de SPM (Cordeiro), bandas S2 B1-B8A, conforme
+# getpak/data/Means_OWT_Cordeiro_S2A_SPM.json (GET-Pak, commit 7e04ba3).
+GETPAK_OWT_MEANS = np.array([
+    [0.0043, 0.0058, 0.0102, 0.0077, 0.0067, 0.0024, 0.0024, 0.0015, 0.0013],
+    [0.0105, 0.0146, 0.0271, 0.0323, 0.0297, 0.0140, 0.0145, 0.0097, 0.0084],
+    [0.0151, 0.0198, 0.0352, 0.0459, 0.0455, 0.0317, 0.0325, 0.0258, 0.0236],
+    [0.0224, 0.0287, 0.0519, 0.0722, 0.0735, 0.0530, 0.0554, 0.0433, 0.0393]])
+GETPAK_BANDS = ["wl440", "blue", "green", "red", "wl705", "wl740", "wl780", "NIR", "wl800"]
+
+
+def sss_getpak_owt_blend(df, options):
+    """SPM superficial pelas inversões do GET-Pak (Tavares et al., 2025) com mistura suave
+    entre tipos ópticos: o espectro mediano da data (Rrs = valor * scale / pi) é comparado às
+    médias dos 4 OWT por distância euclidiana; a estimativa é a média das inversões dos 2 OWT
+    mais próximos ponderada por 1/d². OWT 1: Jiang 2021 verde; 2: Jiang 2021 vermelho;
+    3: Zhang 2014 (B5); 4: Binding 2010 (B6). Experimental (coeficientes da literatura)."""
+    import getpak_inversions as gp
+    out = df.copy()
+    scale = options.get("scale", 1e-4)
+    rrs = {b: pd.to_numeric(out[b], errors="coerce").to_numpy(dtype=float) * scale / np.pi
+           for b in GETPAK_BANDS}
+    x = np.column_stack([rrs[b] for b in GETPAK_BANDS])
+    valid = np.isfinite(x).all(axis=1) & (rrs["red"] > 0)
+    sss = np.full(len(out), np.nan)
+    if valid.any():
+        xv = x[valid]
+        d = np.linalg.norm(xv[:, None, :] - GETPAK_OWT_MEANS[None, :, :], axis=2)
+        r = {b: rrs[b][valid] for b in GETPAK_BANDS}
+        kw = dict(Aerosol=r["wl440"], Blue=r["blue"], Green=r["green"], Red=r["red"])
+        with np.errstate(all="ignore"):
+            alg = np.column_stack([gp.spm_jiang2021_green(**kw), gp.spm_jiang2021_red(**kw),
+                                   gp.spm_zhang2014(RedEdge1=r["wl705"]),
+                                   gp.spm_binding2010(RedEdge2=r["wl740"])])
+        idx = np.argsort(d, axis=1)[:, :2]
+        w = 1.0 / np.maximum(np.take_along_axis(d, idx, axis=1), 1e-9) ** 2
+        w = w / w.sum(axis=1, keepdims=True)
+        a2 = np.take_along_axis(alg, idx, axis=1)
+        blend = np.where(np.isfinite(a2).all(axis=1), (w * a2).sum(axis=1), np.nan)
+        sss[valid] = np.where(blend >= 0, blend, np.nan)
+    out["SSS"] = sss
+    out.loc[~_apply_quality_filter(out).to_numpy(), "SSS"] = np.nan
+    return out
+
+
 #%% Build a catalog of algorithms
 
 _algo_list = [
@@ -386,6 +430,24 @@ _algo_list = [
         "applicable_suffixes": ["median"],
         "function": ss_paraguai_red,
         "options": None
+     },
+     {
+        "algo_code": 24,
+        "name": "SSS GET-Pak OWT mistura (experimental)",
+        "description": "Experimental. Surface SPM from the GET-Pak inversions "
+            + "(4 optical water types; Jiang 2021 green/red, Zhang 2014, "
+            + "Binding 2010) with smooth blending between the two closest "
+            + "types (1/d^2). Requires Sentinel-2 bands B1-B8A as reflectance "
+            + "x 10000 (Rrs = value * 1e-4 / pi). Literature coefficients, "
+            + "not calibrated for Brazilian rivers.",
+        "ref": "Tavares, M.H. et al. A Framework to Retrieve Water Quality "
+            + "Parameters in Small, Optically Diverse Freshwater Ecosystems "
+            + "Using Sentinel-2 MSI Imagery. Remote Sensing 17(15):2729, 2025; "
+            + "GET-Pak (SNO-HYBAM), commit 7e04ba3.",
+        "required_bands": GETPAK_BANDS + ["qual_flag"],
+        "applicable_suffixes": ["median"],
+        "function": sss_getpak_owt_blend,
+        "options": {"scale": 1e-4}
      }
 ]
 
