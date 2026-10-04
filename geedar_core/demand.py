@@ -2056,6 +2056,12 @@ class Demand:
         acq_recs = geedar_db.get_table("acquisition",
             where_str = acq_demand_fkey_col + " = " + str(demand_id))
         acq_recs.columns = [c.upper() for c in [*acq_recs.columns]]
+        # Normalized date ("YYYY-MM-DD") and time ("HH:MM:SS") keys: depending
+        # on the backend, dates come back as date objects (SQL Server) or as
+        # "YYYY-MM-DD 00:00:00" strings (SQLite); comparing the raw string
+        # representation fails in the latter case and duplicates records.
+        acq_date_keys = acq_recs[acq_date_col].astype(str).str[:10]
+        acq_time_keys = acq_recs[acq_time_col].astype(str).str[-8:]
 
         # Get the last primary key values.
         last_acq_id = geedar_db.get_last_id("acquisition")
@@ -2084,8 +2090,8 @@ class Demand:
             datestr = df_ind.strftime("%Y-%m-%d")
             timestr = df_ind.strftime("1900-01-01 %H:%M:%S")
             filt_acq_recs = acq_recs[
-                (acq_recs[acq_date_col].astype(str) == datestr) &
-                (acq_recs[acq_time_col].astype(str) == timestr) &
+                (acq_date_keys == datestr) &
+                (acq_time_keys == timestr[-8:]) &
                 (acq_recs[acq_source_col] == source_id)]
             if len(filt_acq_recs) > 0:
                 # A record exists. No row will be inserted in the dataframe.
