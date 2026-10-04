@@ -251,6 +251,116 @@ def sss_getpak_owt_blend(df, options):
     return out
 
 
+# Jiang et al. (2023), Sentinel-2 MSI: TSS pelo bbp (QAA) na banda de referência do tipo de água.
+# Coeficientes, polinômio de Rrs(620) e regra de escolha idênticos ao código oficial
+# (github.com/DalinJiang/TSS, MSI/TSS_function_Jiang_MSI.R, v1.0, 21/08/2023). Nada calibrado aqui.
+# Obs.: o GET-Pak (getpak_inversions.py) usa -0.0895 no termo u do QAA; o oficial usa -0.089.
+_JIANG_AW = {443: 0.00515124, 490: 0.01919594, 560: 0.06299986, 665: 0.41395333,
+             740: 2.71167020, 865: 4.61714226}
+_JIANG_BBW = {560: 0.00078491, 665: 0.00037474, 740: 0.00023499, 865: 0.00012066}
+_JIANG_FATOR = {560: 94.48785, 665: 113.87498, 740: 134.91845, 865: 166.07382}
+JIANG_RAMOS = [560, 665, 740, 865]
+
+
+def _jiang_u(Rrs):
+    rrs = Rrs / (0.52 + 1.7 * Rrs)
+    return (-0.089 + np.sqrt(0.089 ** 2 + 4 * 0.125 * rrs)) / (2 * 0.125), rrs
+
+
+def jiang2023_ramos(r443, r490, r560, r665, r740, r865):
+    """TSS (g/m3) dos 4 ramos de Jiang 2023 (560, 665, 740, 865 nm); entradas Rrs (sr^-1) acima d'água."""
+    with np.errstate(all="ignore"):
+        u = {}
+        rs = {}
+        for w, R in [(443, r443), (490, r490), (560, r560), (665, r665), (740, r740), (865, r865)]:
+            u[w], rs[w] = _jiang_u(np.asarray(R, dtype=float))
+        x = np.log10((rs[443] + rs[490]) / (rs[560] + 5 * rs[665] * rs[665] / rs[490]))
+        a = {560: _JIANG_AW[560] + 10 ** (-1.146 - 1.366 * x - 0.469 * x ** 2),
+             665: _JIANG_AW[665] + 0.39 * (np.asarray(r665, float) / (np.asarray(r443, float)
+                                                                      + np.asarray(r490, float))) ** 1.14,
+             740: _JIANG_AW[740], 865: _JIANG_AW[865]}
+        ramos = [_JIANG_FATOR[w] * ((u[w] * a[w]) / (1 - u[w]) - _JIANG_BBW[w]) for w in JIANG_RAMOS]
+    return np.column_stack(ramos)
+
+
+def jiang2023_rrs620(r665):
+    r665 = np.asarray(r665, dtype=float)
+    return 1.693846e+02 * r665 ** 3 - 1.557556e+01 * r665 ** 2 + 1.316727e+00 * r665 + 1.484814e-04
+
+
+def jiang2023_pesos(r490, r560, r665, r740, tau=0.0):
+    """Pesos dos ramos (560, 665, 740, 865) pela regra publicada de Jiang (MSI):
+    490>560 -> 560; senão 490>620 -> 665; senão 740>max(490; 0,010) -> 865; senão 740.
+    tau = 0 reproduz a regra rígida; tau > 0 troca cada comparação por uma logística em log10(razão)."""
+    r490, r560, r740 = (np.asarray(v, dtype=float) for v in (r490, r560, r740))
+    r620 = jiang2023_rrs620(r665)
+
+    def s(num, den):
+        with np.errstate(all="ignore"):
+            if tau == 0:
+                return (num > den).astype(float)
+            lr = np.log10(num / den)
+            return np.where(np.isfinite(lr), 1.0 / (1.0 + np.exp(-np.clip(lr / tau, -50, 50))),
+                            (num > den).astype(float))
+    s1, s2, s3 = s(r490, r560), s(r490, r620), s(r740, np.maximum(r490, 0.010))
+    return np.column_stack([s1, (1 - s1) * s2, (1 - s1) * (1 - s2) * (1 - s3), (1 - s1) * (1 - s2) * s3])
+
+
+def _combinar(pesos, ramos):
+    contrib = np.where(pesos > 1e-6, pesos * ramos, 0.0)
+    tss = contrib.sum(axis=1)
+    return np.where(np.isfinite(tss) & (tss >= 0), tss, np.nan)
+
+
+def _rrs_de_df(df, options, bandas):
+    scale = options.get("scale", 1e-4)
+    return {b: pd.to_numeric(df[b], errors="coerce").to_numpy(dtype=float) * scale / np.pi for b in bandas}
+
+
+def sss_getpak_jiang_owt_blend(df, options):
+    """L25: o mesmo esquema do L24 (OWT de Cordeiro, mistura 1/d² dos 2 mais próximos), mas com os 4 ramos
+    publicados de Jiang 2023 (MSI): OWT 1 -> 560 nm, 2 -> 665, 3 -> 740, 4 -> 865 (no lugar de Zhang 2014
+    e Binding 2010). Experimental; coeficientes publicados, sem calibração."""
+    out = df.copy()
+    rrs = _rrs_de_df(out, options, GETPAK_BANDS)
+    x = np.column_stack([rrs[b] for b in GETPAK_BANDS])
+    valid = np.isfinite(x).all(axis=1) & (rrs["red"] > 0)
+    sss = np.full(len(out), np.nan)
+    if valid.any():
+        d = np.linalg.norm(x[valid][:, None, :] - GETPAK_OWT_MEANS[None, :, :], axis=2)
+        r = {b: rrs[b][valid] for b in GETPAK_BANDS}
+        alg = jiang2023_ramos(r["wl440"], r["blue"], r["green"], r["red"], r["wl740"], r["wl800"])
+        idx = np.argsort(d, axis=1)[:, :2]
+        w = 1.0 / np.maximum(np.take_along_axis(d, idx, axis=1), 1e-9) ** 2
+        pesos = np.zeros_like(d)
+        np.put_along_axis(pesos, idx, w / w.sum(axis=1, keepdims=True), axis=1)
+        sss[valid] = _combinar(pesos, alg)
+    out["SSS"] = sss
+    out.loc[~_apply_quality_filter(out).to_numpy(), "SSS"] = np.nan
+    return out
+
+
+JIANG_BANDS = ["wl440", "blue", "green", "red", "wl740", "wl800"]
+
+
+def sss_jiang2023_suave(df, options):
+    """L26: Jiang 2023 (MSI) com a regra publicada de tipo de água em transições logísticas (tau em
+    log10 da razão; tau = 0 é o método original). Experimental; coeficientes publicados, sem calibração."""
+    out = df.copy()
+    rrs = _rrs_de_df(out, options, JIANG_BANDS)
+    x = np.column_stack([rrs[b] for b in JIANG_BANDS])
+    valid = np.isfinite(x).all(axis=1) & (rrs["red"] > 0)
+    sss = np.full(len(out), np.nan)
+    if valid.any():
+        r = {b: rrs[b][valid] for b in JIANG_BANDS}
+        alg = jiang2023_ramos(r["wl440"], r["blue"], r["green"], r["red"], r["wl740"], r["wl800"])
+        pesos = jiang2023_pesos(r["blue"], r["green"], r["red"], r["wl740"], options.get("tau", 0.05))
+        sss[valid] = _combinar(pesos, alg)
+    out["SSS"] = sss
+    out.loc[~_apply_quality_filter(out).to_numpy(), "SSS"] = np.nan
+    return out
+
+
 #%% Build a catalog of algorithms
 
 _algo_list = [
@@ -448,6 +558,37 @@ _algo_list = [
         "applicable_suffixes": ["median"],
         "function": sss_getpak_owt_blend,
         "options": {"scale": 1e-4}
+     },
+     {
+        "algo_code": 25,
+        "name": "SSS GET-Pak OWT x Jiang 2023 (experimental)",
+        "description": "Experimental. Same scheme as algorithm 24 (Cordeiro "
+            + "OWTs, 1/d^2 blending of the two closest types), but every type "
+            + "uses the published Jiang et al. (2023) MSI QAA branch: OWT1 560, "
+            + "OWT2 665, OWT3 740, OWT4 865 nm. Published coefficients, no "
+            + "calibration. Bands B1-B8A as reflectance x 10000.",
+        "ref": "Jiang, D. et al. Estimating the concentration of total "
+            + "suspended solids in inland and coastal waters from Sentinel-2 "
+            + "MSI: a semi-analytical approach. ISPRS J. Photogramm. Remote "
+            + "Sens. 204:362-377, 2023; Tavares et al. 2025 (GET-Pak).",
+        "required_bands": GETPAK_BANDS + ["qual_flag"],
+        "applicable_suffixes": ["median"],
+        "function": sss_getpak_jiang_owt_blend,
+        "options": {"scale": 1e-4}
+     },
+     {
+        "algo_code": 26,
+        "name": "SSS Jiang 2023 transicoes suaves (experimental)",
+        "description": "Experimental. Jiang et al. (2023) MSI method with its "
+            + "published water-type rule turned into logistic transitions "
+            + "(tau on log10 ratios; tau = 0 is the original method). "
+            + "Published coefficients, no calibration.",
+        "ref": "Jiang, D. et al. ISPRS J. Photogramm. Remote Sens. "
+            + "204:362-377, 2023 (github.com/DalinJiang/TSS).",
+        "required_bands": JIANG_BANDS + ["qual_flag"],
+        "applicable_suffixes": ["median"],
+        "function": sss_jiang2023_suave,
+        "options": {"scale": 1e-4, "tau": 0.05}
      }
 ]
 
