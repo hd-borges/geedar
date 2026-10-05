@@ -340,6 +340,33 @@ def sss_getpak_jiang_owt_blend(df, options):
     return out
 
 
+GETPAK_BANDS_SEM_B1 = GETPAK_BANDS[1:]  # B2-B8A (10 e 20 m): sem a banda de 60 m
+
+
+def sss_getpak_jiang_sem_b1(df, options):
+    """L27: L25 sem a banda de 60 m (B1). A classificação usa as médias publicadas de Cordeiro só nas colunas
+    B2-B8A, e no QAA de Jiang Rrs(443) é aproximado por Rrs(490) (aproximação, sem ajuste). Ramos Jiang 2023:
+    OWT 1 -> 560 nm, 2 -> 665, 3 -> 740, 4 -> 865; mistura 1/d² dos 2 tipos mais próximos.
+    Experimental; coeficientes publicados, sem calibração."""
+    out = df.copy()
+    rrs = _rrs_de_df(out, options, GETPAK_BANDS_SEM_B1)
+    x = np.column_stack([rrs[b] for b in GETPAK_BANDS_SEM_B1])
+    valid = np.isfinite(x).all(axis=1) & (rrs["red"] > 0)
+    sss = np.full(len(out), np.nan)
+    if valid.any():
+        d = np.linalg.norm(x[valid][:, None, :] - GETPAK_OWT_MEANS[None, :, 1:], axis=2)
+        r = {b: rrs[b][valid] for b in GETPAK_BANDS_SEM_B1}
+        alg = jiang2023_ramos(r["blue"], r["blue"], r["green"], r["red"], r["wl740"], r["wl800"])
+        idx = np.argsort(d, axis=1)[:, :2]
+        w = 1.0 / np.maximum(np.take_along_axis(d, idx, axis=1), 1e-9) ** 2
+        pesos = np.zeros_like(d)
+        np.put_along_axis(pesos, idx, w / w.sum(axis=1, keepdims=True), axis=1)
+        sss[valid] = _combinar(pesos, alg)
+    out["SSS"] = sss
+    out.loc[~_apply_quality_filter(out).to_numpy(), "SSS"] = np.nan
+    return out
+
+
 JIANG_BANDS = ["wl440", "blue", "green", "red", "wl740", "wl800"]
 
 
@@ -589,6 +616,20 @@ _algo_list = [
         "applicable_suffixes": ["median"],
         "function": sss_jiang2023_suave,
         "options": {"scale": 1e-4, "tau": 0.05}
+     },
+     {
+        "algo_code": 27,
+        "name": "SSS GET-Pak OWT x Jiang 2023 sem B1 (experimental)",
+        "description": "Experimental. Algorithm 25 without the 60 m band "
+            + "(B1): Cordeiro OWT classification on B2-B8A only and "
+            + "Rrs(443) approximated by Rrs(490) in the Jiang QAA. Published "
+            + "coefficients, no calibration. Bands B2-B8A as reflectance x 10000.",
+        "ref": "Jiang et al. 2023 (ISPRS J. 204:362-377); Tavares et al. 2025 "
+            + "(GET-Pak); comparison in analises/2026-10-04_comparacao_l24_l25_l26.",
+        "required_bands": GETPAK_BANDS_SEM_B1 + ["qual_flag"],
+        "applicable_suffixes": ["median"],
+        "function": sss_getpak_jiang_sem_b1,
+        "options": {"scale": 1e-4}
      }
 ]
 
